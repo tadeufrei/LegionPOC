@@ -1,0 +1,6 @@
+enabled: true
+target_epsilon: 1.64
+delta: 1.0e-5
+max_grad_norm: 1.0
+accountant: rdp
+per_client_calibration: true   # calibrate noise per client, not from smallest

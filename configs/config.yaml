@@ -1,0 +1,27 @@
+defaults:
+  - dataset: nslkdd
+  - partition: iid
+  - privacy: none
+  - _self_
+
+seed: 42
+num_clients: 4
+num_rounds: 3
+local_epochs: 10
+batch_size: 512
+lr: 0.001
+device: auto
+threshold: youden        # youden | fixed
+runs: 1                  # repetitions (DP experiments use 3)
+
+run:
+  tag: default
+  store: results/runs.duckdb
+  json: results/results.json
+
+hydra:
+  run:
+    dir: results/${run.tag}/${now:%Y%m%d-%H%M%S}
+  sweep:
+    dir: results/${run.tag}
+    subdir: ${hydra.job.num}

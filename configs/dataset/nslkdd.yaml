@@ -1,0 +1,6 @@
+name: nslkdd
+dir: data/nslkdd
+input_dim: 122
+n_train: 125973
+n_test: 22544
+label_col: label

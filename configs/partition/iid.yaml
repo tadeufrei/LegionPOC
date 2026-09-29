@@ -1,0 +1,2 @@
+kind: iid
+samples_per_client: null       # null = use all available

@@ -1,0 +1,15 @@
+# @package _global_
+# Reproduces the INForum 2026 Table 1 configuration
+defaults:
+  - override /dataset: nslkdd
+  - override /partition: iid
+  - override /privacy: none
+
+seed: 42
+num_clients: 4
+num_rounds: 3
+local_epochs: 10
+batch_size: 512
+lr: 0.001
+run:
+  tag: repro
