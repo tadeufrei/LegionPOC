@@ -1,0 +1,34 @@
+[project]
+name = "legionpoc"
+version = "0.2.0"
+requires-python = ">=3.12"
+dependencies = [
+  "torch>=2.5", "flwr[simulation]>=1.13", "opacus>=1.5",
+  "numpy", "pandas", "scikit-learn", "scipy",
+  "hydra-core>=1.3", "omegaconf",
+  "duckdb", "pyarrow", "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = ["ruff", "pytest", "pytest-xdist", "ipython"]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+# CUDA wheels only on Linux. macOS gets the default PyPI wheel (arm64 + MPS).
+torch = [{ index = "pytorch-cu124", marker = "sys_platform == 'linux'" }]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+
