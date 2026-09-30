@@ -305,6 +305,39 @@ def get_noise_multiplier_for_epsilon(target_epsilon, sample_rate, epochs=None,
 
 
 # ─────────────────────────────────────────────
+# Experiment 0: Centralised (pooled data) baseline
+# ─────────────────────────────────────────────
+def run_centralised(train_df, test_df, epochs, lr, label="centralised"):
+    """Pooled-data upper bound: one model, all data, no partitioning.
+
+    `epochs` is the TOTAL number of passes over the pooled training set.
+    main() passes rounds * epochs so the optimisation budget matches what a
+    single FL client receives across every round, making the gap to FL
+    attributable to federation rather than to training length.
+
+    Returns the same dict shape as run_fl(), with the single training run
+    recorded as one entry in "rounds".
+    """
+    print(f"\n{'='*60}")
+    print(f"EXPERIMENT: {label} — Centralised (pooled), {epochs} epochs")
+    print(f"{'='*60}")
+    print(f"  n={len(train_df):,} | attack={train_df['label'].mean():.2f}")
+
+    model  = Net()
+    loader = df_to_loader(train_df)
+    model  = local_train(model, loader, epochs, lr)
+    m      = evaluate(model, test_df)
+    print(f"  Centralised model: {m}")
+
+    return {
+        "config": label,
+        "type":   "centralised",
+        "rounds": [{"round": 1, **asdict(m)}],
+        "final":  asdict(m),
+    }
+
+
+# ─────────────────────────────────────────────
 # Experiment 1: Local baseline
 # ─────────────────────────────────────────────
 def run_local_baseline(train_parts, test_df, epochs, lr, label="local"):
@@ -801,6 +834,8 @@ def main():
     all_results = []
     t0 = time.time()
 
+    all_results.append(run_centralised(train_df, test_df,
+                                       args.rounds * args.epochs, args.lr))
     all_results.append(run_local_baseline(iid_parts,    test_df, args.epochs, args.lr, "local_iid"))
     all_results.append(run_local_baseline(noniid_parts, test_df, args.epochs, args.lr, "local_noniid"))
     all_results.append(run_fl(iid_parts,    test_df, args.rounds, args.epochs, args.lr, "fl_iid"))
