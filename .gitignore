@@ -61,7 +61,6 @@ flowr/
 # --- LegionITS additions ---
 .DS_Store
 data/raw/
-results/
 outputs/
 *.duckdb
 *.pt
