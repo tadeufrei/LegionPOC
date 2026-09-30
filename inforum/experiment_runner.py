@@ -21,6 +21,7 @@ Usage:
 import argparse
 import json
 import os
+import random
 import time
 import warnings
 from collections import OrderedDict
@@ -45,6 +46,12 @@ N_CLIENTS    = 4
 BATCH_SIZE   = 512
 TARGET_DELTA = 1e-5
 INPUT_DIM    = 122          # NSL-KDD features after one-hot encoding
+DEFAULT_SEED = 42
+
+# Accountant used for BOTH sigma calibration and epsilon reporting. Opacus'
+# PrivacyEngine defaults to "prv"; calibrating with a different mechanism than
+# we report with silently mislabels the budget.
+ACCOUNTANT   = "prv"
 NONIID_RATIOS = [0.1, 0.3, 0.5, 0.7]
 EPSILON_SWEEP = [0.5, 1.0, 1.64, 3.0, 5.0]
 
@@ -121,20 +128,44 @@ def load_nslkdd(data_dir):
     return train, test
 
 
-def df_to_loader(df, shuffle=True, batch_size=BATCH_SIZE):
+def set_seed(seed=DEFAULT_SEED):
+    """Seed every RNG the experiments draw from."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _loader_generator(seed=None):
+    """Seeded generator for one DataLoader.
+
+    With seed=None the seed is drawn from torch's global RNG, which set_seed()
+    has already fixed: the run stays reproducible while successive loaders
+    (and successive repetitions in run_fl_dp_averaged) still shuffle
+    differently.
+    """
+    if seed is None:
+        seed = int(torch.randint(0, 2 ** 31 - 1, (1,)).item())
+    g = torch.Generator()
+    g.manual_seed(int(seed))
+    return g
+
+
+def df_to_loader(df, shuffle=True, batch_size=BATCH_SIZE, seed=None):
     X = torch.tensor(df.drop(columns=['label']).values.astype(np.float32),
                      dtype=torch.float32)
     y = torch.tensor(df['label'].values.astype(np.float32),
                      dtype=torch.float32).view(-1, 1)
     return DataLoader(TensorDataset(X, y),
                       batch_size=batch_size, shuffle=shuffle,
-                      drop_last=True)
+                      drop_last=True, generator=_loader_generator(seed))
 
 
 # ─────────────────────────────────────────────
 # Data splitting
 # ─────────────────────────────────────────────
-def iid_split(df, n, n_per_client=None):
+def iid_split(df, n, n_per_client=None, seed=DEFAULT_SEED):
     """Balanced IID split — equal attack/normal ratio per client."""
     df_n = df[df['label'] == 0].reset_index(drop=True)
     df_a = df[df['label'] == 1].reset_index(drop=True)
@@ -152,17 +183,17 @@ def iid_split(df, n, n_per_client=None):
         part = pd.concat([
             df_n.iloc[i * per_n:(i + 1) * per_n],
             df_a.iloc[i * per_a:(i + 1) * per_a],
-        ]).sample(frac=1, random_state=42).reset_index(drop=True)
+        ]).sample(frac=1, random_state=seed).reset_index(drop=True)
         parts.append(part)
     return parts
 
 
-def noniid_split(df, ratios, n_per_client):
+def noniid_split(df, ratios, n_per_client, seed=DEFAULT_SEED):
     """Non-IID label-skew split.
     Client i gets fraction ratios[i] of attack (label=1) samples,
     simulating organisations with different threat exposure levels."""
-    df_n = df[df['label'] == 0].sample(frac=1, random_state=42).reset_index(drop=True)
-    df_a = df[df['label'] == 1].sample(frac=1, random_state=42).reset_index(drop=True)
+    df_n = df[df['label'] == 0].sample(frac=1, random_state=seed).reset_index(drop=True)
+    df_a = df[df['label'] == 1].sample(frac=1, random_state=seed).reset_index(drop=True)
 
     parts = []
     n_off, a_off = 0, 0
@@ -176,7 +207,7 @@ def noniid_split(df, ratios, n_per_client):
         part = pd.concat([
             df_n.iloc[n_off:n_off + n_n],
             df_a.iloc[a_off:a_off + n_a],
-        ]).sample(frac=1, random_state=42).reset_index(drop=True)
+        ]).sample(frac=1, random_state=seed).reset_index(drop=True)
         parts.append(part)
         n_off += n_n
         a_off += n_a
@@ -237,12 +268,18 @@ def local_train(model, loader, epochs, lr):
     return model
 
 
-def dp_train(model, loader, epochs, noise_multiplier, max_grad_norm=1.0):
-    from opacus import PrivacyEngine
+def dp_train(model, loader, epochs, noise_multiplier, privacy_engine,
+             max_grad_norm=1.0):
+    """One round of DP-SGD for a single client.
+
+    `privacy_engine` is owned by the caller and reused across rounds, so its
+    accountant accumulates the budget instead of restarting every round.
+    make_private() only attaches a step hook to the existing accountant — it
+    does not clear the history.
+    """
     model.to(DEVICE).train()
     opt = torch.optim.Adam(model.parameters(), lr=0.001)
-    pe  = PrivacyEngine(secure_mode=False)
-    model, opt, private_loader = pe.make_private(
+    model, opt, private_loader = privacy_engine.make_private(
         module=model, optimizer=opt, data_loader=loader,
         noise_multiplier=noise_multiplier, max_grad_norm=max_grad_norm,
     )
@@ -253,16 +290,18 @@ def dp_train(model, loader, epochs, noise_multiplier, max_grad_norm=1.0):
             opt.zero_grad()
             loss_fn(model(X), y).backward()
             opt.step()
-    eps = pe.get_epsilon(delta=TARGET_DELTA)
     if hasattr(model, '_module'):
         model = model._module
-    return model, float(eps)
+    return model
 
 
-def get_noise_multiplier_for_epsilon(target_epsilon, sample_rate, epochs):
+def get_noise_multiplier_for_epsilon(target_epsilon, sample_rate, epochs=None,
+                                     steps=None):
+    """Calibrate sigma. Pass exactly one of `epochs` or `steps`."""
     from opacus.accountants.utils import get_noise_multiplier as _gnm
     return _gnm(target_epsilon=target_epsilon, target_delta=TARGET_DELTA,
-                sample_rate=sample_rate, epochs=epochs, accountant="rdp")
+                sample_rate=sample_rate, epochs=epochs, steps=steps,
+                accountant=ACCOUNTANT)
 
 
 # ─────────────────────────────────────────────
@@ -335,58 +374,89 @@ def run_fl(train_parts, test_df, rounds, epochs, lr, label="fl"):
 # Experiment 3: FL+DP (averaged over n runs)
 # ─────────────────────────────────────────────
 def run_fl_dp(train_parts, test_df, rounds, epochs,
-              target_epsilon, label="fl_dp"):
-    print(f"\n  → FL+DP target ε={target_epsilon}")
+              target_epsilon, label="fl_dp", seed=None):
+    """FedAvg + DP-SGD with a privacy budget composed across all rounds.
+
+    One PrivacyEngine per client lives for the whole federation, so each
+    client's accountant composes its budget over every round. sigma is
+    calibrated against that full budget, at the sample rate Opacus actually
+    accounts with (1/len(loader), since the loader drops its last partial
+    batch) rather than BATCH_SIZE/min_n.
+    """
+    from opacus import PrivacyEngine
+
+    print(f"\n  \u2192 FL+DP target \u03b5={target_epsilon} "
+          f"(composed over {rounds} rounds)")
     results = {"config": label, "type": "fl_dp",
                "target_epsilon": target_epsilon, "rounds": []}
 
-    min_n       = min(len(p) for p in train_parts)
-    sample_rate = BATCH_SIZE / min_n
-    noise_mult  = get_noise_multiplier_for_epsilon(target_epsilon, sample_rate, epochs)
-    print(f"     noise_multiplier={noise_mult:.4f}")
-    results["noise_multiplier"] = round(noise_mult, 4)
+    global_model = Net()
+    # Distinct deterministic loader seed per client, so clients do not share a
+    # batch order. seed=None falls back to the global RNG fixed by set_seed().
+    loaders = [df_to_loader(p, seed=None if seed is None else seed + i)
+               for i, p in enumerate(train_parts)]
 
-    global_model     = Net()
-    loaders          = [df_to_loader(p) for p in train_parts]
-    achieved_epsilons = []
+    noise_mults, engines = [], []
+    for loader in loaders:
+        n_batches = len(loader)
+        noise_mults.append(get_noise_multiplier_for_epsilon(
+            target_epsilon, 1.0 / n_batches,
+            steps=rounds * epochs * n_batches))
+        engines.append(PrivacyEngine(accountant=ACCOUNTANT, secure_mode=False))
 
+    results["noise_multiplier"] = [round(nm, 4) for nm in noise_mults]
+    print(f"     noise_multiplier/client={results['noise_multiplier']}")
+
+    per_round_eps = []
     for r in range(1, rounds + 1):
         print(f"     Round {r}/{rounds}", end=" | ")
         cw, cs, round_eps = [], [], []
-        for loader in loaders:
+        for loader, noise_mult, pe in zip(loaders, noise_mults, engines,
+                                          strict=True):
             cm = Net()
             set_weights(cm, get_weights(global_model))
-            cm, eps = dp_train(cm, loader, epochs, noise_mult)
+            cm = dp_train(cm, loader, epochs, noise_mult, privacy_engine=pe)
             cw.append(get_weights(cm))
             cs.append(len(loader.dataset))
-            round_eps.append(eps)
+            round_eps.append(float(pe.get_epsilon(delta=TARGET_DELTA)))
         set_weights(global_model, average_weights(cw, cs))
         m       = evaluate(global_model, test_df)
         avg_eps = float(np.mean(round_eps))
-        achieved_epsilons.append(avg_eps)
-        print(f"ε={avg_eps:.4f} | {m}")
-        results["rounds"].append({"round": r, "achieved_epsilon": avg_eps, **asdict(m)})
+        per_round_eps.append(avg_eps)
+        print(f"\u03b5={avg_eps:.4f} cumulative | {m}")
+        results["rounds"].append({"round": r, "achieved_epsilon": avg_eps,
+                                  **asdict(m)})
 
-    results["final"]                = asdict(evaluate(global_model, test_df))
-    results["mean_achieved_epsilon"] = float(np.mean(achieved_epsilons))
+    results["final"]             = asdict(evaluate(global_model, test_df))
+    results["per_round_epsilon"] = per_round_eps
+    results["composed_epsilon"]  = per_round_eps[-1]
+    # Total budget after all rounds. This key previously held the mean of the
+    # per-round values, which were identical because the accountant reset.
+    results["mean_achieved_epsilon"] = per_round_eps[-1]
     return results
 
 
 def run_fl_dp_averaged(train_parts, test_df, rounds, epochs,
-                        target_epsilon, n_runs=3, label="fl_dp"):
+                        target_epsilon, n_runs=3, label="fl_dp", seed=None):
     print(f"\n{'='*60}")
     print(f"EXPERIMENT: {label} — FL+DP (ε={target_epsilon}, {n_runs} runs)")
     print(f"{'='*60}")
 
     all_finals, all_eps = [], []
+    all_nm, all_per_round = [], []
     all_rounds = [[] for _ in range(rounds)]
 
     for run in range(n_runs):
         print(f"\n  Run {run+1}/{n_runs}")
+        # Offset per repetition so the runs differ in batch order as well as
+        # in DP noise, while staying reproducible from --seed.
         result = run_fl_dp(train_parts, test_df, rounds, epochs,
-                           target_epsilon, label=f"{label}_run{run}")
+                           target_epsilon, label=f"{label}_run{run}",
+                           seed=None if seed is None else seed + 1000 * run)
         all_finals.append(result["final"])
-        all_eps.append(result["mean_achieved_epsilon"])
+        all_eps.append(result["composed_epsilon"])
+        all_nm.append(result["noise_multiplier"])
+        all_per_round.append(result["per_round_epsilon"])
         for r_data in result["rounds"]:
             all_rounds[r_data["round"] - 1].append(r_data)
 
@@ -406,6 +476,10 @@ def run_fl_dp_averaged(train_parts, test_df, rounds, epochs,
         "type":                 "fl_dp",
         "target_epsilon":       target_epsilon,
         "n_runs":               n_runs,
+        "noise_multiplier":      all_nm[0],
+        "composed_epsilon":      float(np.mean(all_eps)),
+        "per_round_epsilon":     [float(np.mean(x))
+                                 for x in zip(*all_per_round, strict=True)],
         "mean_achieved_epsilon": float(np.mean(all_eps)),
         "std_achieved_epsilon":  float(np.std(all_eps)),
         "rounds": avg_rounds,
@@ -488,7 +562,7 @@ def run_mi_experiment(train_df, test_df):
         from opacus import PrivacyEngine
         model.to(DEVICE).train()
         opt = torch.optim.Adam(model.parameters(), lr=0.001)
-        pe  = PrivacyEngine(secure_mode=False)
+        pe  = PrivacyEngine(accountant=ACCOUNTANT, secure_mode=False)
         model, opt, pl = pe.make_private(
             module=model, optimizer=opt, data_loader=loader,
             noise_multiplier=noise_mult, max_grad_norm=1.0)
@@ -667,6 +741,8 @@ def parse_args():
     p.add_argument("--subset",   type=int,   default=None,
                    help="Samples/client cap for IID/non-IID (None = full data)")
     p.add_argument("--output",   default="results.json")
+    p.add_argument("--seed",     type=int,   default=DEFAULT_SEED,
+                   help="Global RNG seed (torch, cuda, numpy, random, splits)")
     p.add_argument("--skip_dp",  action="store_true",
                    help="Skip FL+DP and MI experiments")
     p.add_argument("--mi_only",  action="store_true",
@@ -676,9 +752,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    set_seed(args.seed)
     print(f"Device  : {DEVICE}")
     print(f"Dataset : NSL-KDD ({args.data_dir})")
     print(f"Rounds  : {args.rounds} | Epochs/round: {args.epochs} | LR: {args.lr}")
+    print(f"Seed    : {args.seed} | Accountant: {ACCOUNTANT}")
     if args.subset:
         print(f"Subset  : {args.subset:,} samples/client")
 
@@ -692,8 +770,10 @@ def main():
 
     # ── Splits ────────────────────────────────
     noniid_n     = args.subset if args.subset else NONIID_SAMPLES_PER_CLIENT
-    iid_parts    = iid_split(train_df, N_CLIENTS, n_per_client=args.subset)
-    noniid_parts = noniid_split(train_df, NONIID_RATIOS, noniid_n)
+    iid_parts    = iid_split(train_df, N_CLIENTS, n_per_client=args.subset,
+                             seed=args.seed)
+    noniid_parts = noniid_split(train_df, NONIID_RATIOS, noniid_n,
+                                seed=args.seed)
 
     print("\nIID splits:")
     for i, p in enumerate(iid_parts):
@@ -731,11 +811,11 @@ def main():
             all_results.append(run_fl_dp_averaged(
                 iid_parts, test_df, args.rounds, args.epochs,
                 target_epsilon=eps, n_runs=args.runs,
-                label=f"fl_dp_iid_eps{eps}"))
+                label=f"fl_dp_iid_eps{eps}", seed=args.seed))
         all_results.append(run_fl_dp_averaged(
             noniid_parts, test_df, args.rounds, args.epochs,
             target_epsilon=1.64, n_runs=args.runs,
-            label="fl_dp_noniid_eps1.64"))
+            label="fl_dp_noniid_eps1.64", seed=args.seed))
         all_results.append(run_mi_experiment(train_df, test_df))
 
     elapsed = time.time() - t0
