@@ -52,6 +52,7 @@ def _make_label(result: dict) -> str:
     eps_str = f"{achieved:.2f}" if achieved is not None else "?"
 
     static_labels = {
+        "centralised":  "Centralised (pooled)",
         "local_iid":    "Local (IID)",
         "local_noniid": "Local (Non-IID)",
         "fl_iid":       "FL (IID)",
@@ -167,8 +168,8 @@ def main():
 
     # ── Table 1: IID — Local vs FL vs FL+DP ε sweep ──
     iid_configs = (
-        ["local_iid", "fl_iid"]
-        + [f"fl_dp_iid_eps{e}" for e in [0.5, 1.0, 1.64, 3.0, 5.0]]
+            ["centralised", "local_iid", "fl_iid"]
+            + [f"fl_dp_iid_eps{e}" for e in [0.5, 1.0, 1.64, 3.0, 5.0]]
     )
     iid_rows = [extract_row(by_config[c]) for c in iid_configs if c in by_config]
     plain_table(iid_rows,
